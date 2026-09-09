@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#050505">
+  <meta name="description" content="DINSTORE EHI Config Decryptor">
+  <title>BONGKAR CONFIG EHI</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">
+          <img src="/logo.svg" alt="DINSTORE" onerror="this.style.display='none';this.parentElement.classList.add('logo-fallback');this.parentElement.textContent='D';">
+        </div>
+        <div>
+          <h1>DINSTORE</h1>
+          <span>CONFIG DECRYPTOR</span>
+        </div>
+      </div>
+      <div class="status-top"><i></i> ONLINE</div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="badge">EHI DECRYPTOR</div>
+        <h2>BONGKAR <b>CONFIG</b></h2>
+        <p>Upload file HTTP Injector (.EHI), lalu bongkar konfigurasi dengan tampilan yang rapi dan mudah disalin.</p>
+      </section>
+
+      <section class="card">
+        <div class="card-title">
+          <div>
+            <h3>UPLOAD CONFIG</h3>
+            <p>Format yang didukung: .EHI saja</p>
+          </div>
+          <span class="waiting" id="fileState">WAITING</span>
+        </div>
+
+        <label class="drop-zone" id="uploadBox" for="fileInput">
+          <div class="upload-icon">↑</div>
+          <h4>Pilih File EHI</h4>
+          <p>Klik untuk memilih atau tarik file EHI ke sini</p>
+          <small>.EHI ONLY</small>
+          <input type="file" id="fileInput" accept=".ehi">
+          <div id="fileName" class="file-name"></div>
+        </label>
+
+        <div class="actions">
+          <button type="button" id="decryptBtn" class="primary" disabled>BONGKAR CONFIG</button>
+          <button type="button" id="clearBtn" class="secondary">RESET</button>
+        </div>
+
+        <div id="status" class="console-line muted">Menunggu file...</div>
+      </section>
+
+      <section id="result" class="result"></section>
+    </main>
+
+    <footer>
+      <span>DINSTORE EHI DECRYPTOR</span>
+      <span>EHI ONLY</span>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
