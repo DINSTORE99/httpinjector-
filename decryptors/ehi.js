@@ -2,38 +2,14 @@ const crypto = require("crypto");
 const argon2 = require("argon2");
 const EHI = require("../config/ehi.keys");
 
-// ==================================================
-// XOR
-// ==================================================
-
-function xorBytes(a, b) {
-  const out = Buffer.alloc(a.length);
-
-  for (let i = 0; i < a.length; i++) {
-    out[i] = a[i] ^ b[i % b.length];
-  }
-
-  return out;
-}
-
-// ==================================================
-// AES CBC
-// ==================================================
-
 function aesCbcDecrypt(key, iv, data) {
-  if (!Buffer.isBuffer(key)) key = Buffer.from(key);
-  if (!Buffer.isBuffer(iv)) iv = Buffer.from(iv);
-  if (!Buffer.isBuffer(data)) data = Buffer.from(data);
-
-  if (iv.length !== 16) {
-    throw new Error(`IV AES harus 16 byte, dapat ${iv.length}`);
-  }
-
   const decipher = crypto.createDecipheriv(
     `aes-${key.length * 8}-cbc`,
     key,
     iv
   );
+
+  decipher.setAutoPadding(true);
 
   return Buffer.concat([
     decipher.update(data),
@@ -41,107 +17,114 @@ function aesCbcDecrypt(key, iv, data) {
   ]);
 }
 
-// ==================================================
-// CUSTOM BASE64
-// ==================================================
+function customB64Decode(encoded) {
+  let clean = String(encoded ?? "").replace(/\?/g, "");
 
-function customBase64Decode(value) {
-  let s = Buffer.isBuffer(value)
-    ? value.toString("utf8")
-    : String(value);
+  if (clean.length % 4) {
+    clean += "=".repeat(4 - (clean.length % 4));
+  }
 
   let translated = "";
 
-  for (const ch of s) {
+  for (const ch of clean) {
     const i = EHI.CUSTOM_ALPHABET.indexOf(ch);
-
-    translated +=
-      i === -1
-        ? ch
-        : EHI.STD_ALPHABET[i];
-  }
-
-  translated = translated
-    .replace(/\s+/g, "")
-    .replace(/-/g, "+")
-    .replace(/_/g, "/");
-
-  while (translated.length % 4) {
-    translated += "=";
+    translated += i >= 0 ? EHI.STD_ALPHABET[i] : ch;
   }
 
   return Buffer.from(translated, "base64");
 }
 
-// ==================================================
-// UINT32
-// ==================================================
+// ============================================================
+// XOR LAYER
+// ============================================================
 
-function toUint32Array(buffer) {
-  const n = Math.ceil(buffer.length / 4);
-  const out = new Uint32Array(n);
-
-  for (let i = 0; i < n; i++) {
-    const p = i * 4;
-
-    out[i] =
-      (buffer[p] || 0) |
-      ((buffer[p + 1] || 0) << 8) |
-      ((buffer[p + 2] || 0) << 16) |
-      ((buffer[p + 3] || 0) << 24);
+function decryptXorLayer(ciphertext, key) {
+  if (!ciphertext || !String(ciphertext).trim()) {
+    return ciphertext;
   }
 
-  return out;
-}
+  try {
+    const reversed = String(ciphertext)
+      .split("")
+      .reverse()
+      .join("");
 
-function fromUint32Array(v, length) {
-  const out = Buffer.alloc(v.length * 4);
+    const hexBytes = customB64Decode(reversed);
 
-  for (let i = 0; i < v.length; i++) {
-    out[i * 4] = v[i] & 255;
-    out[i * 4 + 1] = (v[i] >>> 8) & 255;
-    out[i * 4 + 2] = (v[i] >>> 16) & 255;
-    out[i * 4 + 3] = (v[i] >>> 24) & 255;
+    let hex = hexBytes.toString("ascii");
+
+    if (hex.length % 2 !== 0) {
+      hex = `0${hex}`;
+    }
+
+    const raw = Buffer.from(hex, "hex");
+
+    const keyText = String(key ?? "");
+
+    if (!keyText.length) {
+      return null;
+    }
+
+    const out = [];
+
+    for (let i = 0; i < raw.length; i++) {
+      const value =
+        raw[i] ^
+        keyText.charCodeAt(i % keyText.length);
+
+      if (value !== 0) {
+        out.push(value);
+      }
+    }
+
+    const plaintext = Buffer.from(out).toString("utf8");
+
+    if (plaintext) {
+      let bad = 0;
+
+      for (const ch of plaintext) {
+        const code = ch.charCodeAt(0);
+
+        if (
+          code < 32 &&
+          code !== 9 &&
+          code !== 10 &&
+          code !== 13
+        ) {
+          bad++;
+        }
+      }
+
+      if (bad / plaintext.length > 0.5) {
+        return null;
+      }
+    }
+
+    return plaintext;
+  } catch {
+    return null;
   }
-
-  return out.subarray(0, length);
 }
 
-// ==================================================
+// ============================================================
 // XXTEA
-// ==================================================
+// ============================================================
 
 function xxteaDecrypt(data, key) {
   if (!data || !data.length) {
     return Buffer.alloc(0);
   }
 
-  if (!Buffer.isBuffer(data)) {
-    data = Buffer.from(data);
-  }
-
-  const rem = data.length % 4;
-
-  if (rem) {
+  if (data.length % 4) {
     data = Buffer.concat([
       data,
-      Buffer.alloc(4 - rem)
+      Buffer.alloc(4 - (data.length % 4))
     ]);
   }
 
   const n = data.length / 4;
 
-  if (n < 2) {
-    return data;
-  }
-
-  const v = new Uint32Array(n);
-
-  for (let i = 0; i < n; i++) {
-    v[i] = data.readUInt32LE(i * 4);
-  }
-
-  const kk = Buffer.concat([
+  const kbuf = Buffer.concat([
     key,
     Buffer.alloc(16)
   ]).subarray(0, 16);
@@ -149,7 +132,13 @@ function xxteaDecrypt(data, key) {
   const k = new Uint32Array(4);
 
   for (let i = 0; i < 4; i++) {
-    k[i] = kk.readUInt32LE(i * 4);
+    k[i] = kbuf.readUInt32LE(i * 4);
+  }
+
+  const v = new Uint32Array(n);
+
+  for (let i = 0; i < n; i++) {
+    v[i] = data.readUInt32LE(i * 4);
   }
 
   const delta = 0x9e3779b9 >>> 0;
@@ -170,14 +159,12 @@ function xxteaDecrypt(data, key) {
 
       const mx = (
         (
-          (
-            ((z >>> 5) ^ (y << 2)) +
-            ((y >>> 3) ^ (z << 4))
-          ) ^
-          (
-            (sum ^ y) +
-            (k[(p & 3) ^ e] ^ z)
-          )
+          (((z >>> 5) ^ (y << 2)) +
+            ((y >>> 3) ^ (z << 4)))
+        ) ^
+        (
+          (sum ^ y) +
+          (k[(p & 3) ^ e] ^ z)
         )
       ) >>> 0;
 
@@ -189,14 +176,12 @@ function xxteaDecrypt(data, key) {
 
     const mx = (
       (
-        (
-          ((z >>> 5) ^ (y << 2)) +
-          ((y >>> 3) ^ (z << 4))
-        ) ^
-        (
-          (sum ^ y) +
-          (k[e] ^ z)
-        )
+        (((z >>> 5) ^ (y << 2)) +
+          ((y >>> 3) ^ (z << 4)))
+      ) ^
+      (
+        (sum ^ y) +
+        (k[e] ^ z)
       )
     ) >>> 0;
 
@@ -217,25 +202,19 @@ function xxteaDecrypt(data, key) {
     );
   }
 
-  /*
-   * EHI menyimpan panjang plaintext
-   * pada word terakhir.
-   */
-
-  const originalLength =
+  const length =
     v[n - 1] >>> 0;
 
   if (
-    originalLength > 0 &&
-    originalLength <= decrypted.length
+    length > 0 &&
+    length <= n * 4
   ) {
     return decrypted.subarray(
       0,
-      originalLength
+      length
     );
   }
 
-  // fallback: buang null byte di akhir
   let end = decrypted.length;
 
   while (
@@ -245,361 +224,206 @@ function xxteaDecrypt(data, key) {
     end--;
   }
 
-  return decrypted.subarray(
-    0,
-    end
-  );
+  return decrypted.subarray(0, end);
 }
 
-// ==================================================
-// JSON
-// ==================================================
+// ============================================================
+// EHI CONTAINER
+// ============================================================
 
-function decodeConfigMessage(buffer) {
-  const text =
-    buffer.toString("utf8");
+function parseEhiBytes(fileBytes) {
+  let p = 0;
 
-  const start =
-    text.indexOf("{");
-
-  if (start < 0) {
-    throw new Error(
-      "JSON EHI tidak ditemukan setelah XXTEA"
-    );
-  }
-
-  return JSON.parse(
-    text.substring(start)
-  );
-}
-
-// ==================================================
-// EHI CONTAINER PARSER
-// ==================================================
-
-function extractEhiPayload(buffer) {
-  if (!Buffer.isBuffer(buffer)) {
-    buffer = Buffer.from(buffer);
-  }
-
-  let offset = 0;
-
-  function readUTF() {
-    if (offset + 2 > buffer.length) {
+  const readU16BE = () => {
+    if (p + 2 > fileBytes.length) {
       throw new Error(
-        "Header EHI tidak lengkap"
+        "EHI header truncated"
       );
     }
 
-    const length =
-      buffer.readUInt16BE(offset);
+    const n =
+      fileBytes.readUInt16BE(p);
 
-    offset += 2;
+    p += 2;
 
-    if (
-      offset + length > buffer.length
-    ) {
+    return n;
+  };
+
+  const readUtf = () => {
+    const n = readU16BE();
+
+    if (p + n > fileBytes.length) {
       throw new Error(
-        "Panjang UTF EHI tidak valid"
+        "EHI UTF field truncated"
       );
     }
 
-    const value =
-      buffer
-        .subarray(
-          offset,
-          offset + length
-        )
+    const s =
+      fileBytes
+        .subarray(p, p + n)
         .toString("utf8");
 
-    offset += length;
+    p += n;
 
-    return value;
-  }
+    return s;
+  };
 
-  // UTF #1
-  readUTF();
+  // ehi
+  readUtf();
 
-  // 8 byte
-  if (offset + 8 > buffer.length) {
+  if (p + 8 > fileBytes.length) {
     throw new Error(
-      "Header EHI tidak valid"
+      "EHI header truncated"
     );
   }
 
-  offset += 8;
+  p += 8;
 
-  // UTF #2
-  readUTF();
+  // version
+  readUtf();
 
-  // 8 byte
-  if (offset + 8 > buffer.length) {
+  if (p + 8 > fileBytes.length) {
     throw new Error(
-      "Header EHI tidak valid"
+      "EHI header truncated"
     );
   }
 
-  offset += 8;
+  p += 8;
 
-  // Payload length
-  if (offset + 4 > buffer.length) {
+  if (p + 4 > fileBytes.length) {
     throw new Error(
-      "Panjang payload EHI tidak ditemukan"
+      "EHI payload length missing"
     );
   }
 
   const payloadLength =
-    buffer.readUInt32BE(offset);
+    fileBytes.readUInt32BE(p);
 
-  offset += 4;
+  p += 4;
 
-  // 8 byte
-  if (offset + 8 > buffer.length) {
+  if (p + 8 > fileBytes.length) {
     throw new Error(
-      "Header payload EHI tidak lengkap"
+      "EHI payload header truncated"
     );
   }
 
-  offset += 8;
+  p += 8;
 
   if (
-    payloadLength <= 0 ||
-    offset + payloadLength > buffer.length
+    p + payloadLength >
+    fileBytes.length
   ) {
     throw new Error(
-      `Panjang payload EHI tidak valid: ${payloadLength}`
+      "EHI payload truncated"
     );
   }
 
-  return buffer.subarray(
-    offset,
-    offset + payloadLength
+  return fileBytes.subarray(
+    p,
+    p + payloadLength
   );
 }
 
-// ==================================================
-// PYTHON STRING HELPER
-// ==================================================
+// ============================================================
+// MASTER KEY
+// ============================================================
 
 function pyString(value) {
-  if (value === null) {
-    return "None";
-  }
-
-  if (value === undefined) {
-    return "None";
-  }
-
-  if (typeof value === "boolean") {
-    return value ? "True" : "False";
-  }
-
-  if (typeof value === "number") {
-    return String(value);
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
   }
 
   if (typeof value === "string") {
     return value;
   }
 
-  if (Array.isArray(value)) {
-    return (
-      "[" +
-      value
-        .map(v => pyString(v))
-        .join(", ") +
-      "]"
-    );
+  if (typeof value === "boolean") {
+    return value ? "True" : "False";
   }
 
   if (
-    typeof value === "object"
+    typeof value === "number" ||
+    typeof value === "bigint"
   ) {
-    return (
-      "{" +
-      Object.entries(value)
-        .map(
-          ([k, v]) =>
-            `'${k}': ${pyString(v)}`
-        )
-        .join(", ") +
-      "}"
-    );
+    return String(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value
+      .map(v => pyString(v))
+      .join(", ")}]`;
+  }
+
+  if (typeof value === "object") {
+    return `{${Object.entries(value)
+      .map(
+        ([k, v]) =>
+          `'${k}': ${pyString(v)}`
+      )
+      .join(", ")}}`;
   }
 
   return String(value);
 }
 
-// ==================================================
-// MASTER KEY
-// ==================================================
-
 function generateMasterKey(config) {
+  // PENTING:
+  // Jangan ubah urutan field ini.
+  // Ini bagian yang digunakan untuk Argon2.
+
   const values = [
-    config?.configAesKey,
-    config?.configIdentifier,
-    config?.configSalt,
-    config?.configTimestamp,
-    config?.configExpiryTimestamp,
-    config?.lockModes,
-    config?.lockModesHash,
-    config?.configHwid,
-    config?.configLockMobileOperatorId
+    config?.configAesKey ?? "",
+    config?.configIdentifier ?? "",
+    config?.configSalt ?? "",
+    String(
+      config?.configTimestamp ?? 0
+    ),
+    String(
+      config?.configExpiryTimestamp ?? 0
+    ),
+    config?.lockModes ?? "",
+    config?.lockModesHash ?? "",
+    config?.configHwid ?? "",
+    config?.configLockMobileOperatorId ?? ""
   ];
 
-  const payload =
-    values
-      .filter(
-        value =>
-          value !== undefined &&
-          value !== null &&
-          value !== ""
-      )
-      .map(pyString)
-      .join("");
+  const payload = values
+    .filter(
+      v =>
+        v !== null &&
+        v !== undefined &&
+        pyString(v) !== ""
+    )
+    .map(pyString)
+    .join("");
 
   return crypto
     .createHash("sha256")
-    .update(
-      payload,
-      "utf8"
-    )
+    .update(payload, "utf8")
     .digest();
 }
 
-// ==================================================
-// CONFIG DATA XOR LAYER
-// ==================================================
+// ============================================================
+// CONFIG MESSAGE / NOTE
+// ============================================================
 
-function decryptConfigData(
-  ciphertextStr,
-  key
-) {
-  let s =
-    String(ciphertextStr || "");
-
-  if (!s.trim()) {
-    return s;
-  }
-
-  // Reverse
-  const reversed =
-    s
-      .split("")
-      .reverse()
-      .join("");
-
-  // Remove ?
-  let clean =
-    reversed.replace(/\?/g, "");
-
-  while (
-    clean.length % 4
-  ) {
-    clean += "=";
-  }
-
-  let translated = "";
-
-  for (const ch of clean) {
-    const i =
-      EHI.CUSTOM_ALPHABET.indexOf(ch);
-
-    translated +=
-      i === -1
-        ? ch
-        : EHI.STD_ALPHABET[i];
-  }
-
-  const hexString =
-    Buffer
-      .from(
-        translated,
-        "base64"
-      )
-      .toString("ascii");
-
-  const evenHex =
-    hexString.length % 2
-      ? "0" + hexString
-      : hexString;
-
-  const raw =
-    Buffer.from(
-      evenHex,
-      "hex"
-    );
-
-  const keyBuf =
-    Buffer.from(
-      String(key),
-      "utf8"
-    );
-
-  if (!keyBuf.length) {
-    return s;
-  }
-
-  const out = [];
-
-  for (
-    let i = 0;
-    i < raw.length;
-    i++
-  ) {
-    const x =
-      raw[i] ^
-      keyBuf[
-        i % keyBuf.length
-      ];
-
-    /*
-     * Sama dengan reference Python:
-     * byte bernilai 0 setelah XOR
-     * dibuang.
-     */
-    if (x !== 0) {
-      out.push(x);
-    }
-  }
-
-  return Buffer
-    .from(out)
-    .toString("utf8");
-}
-
-// ==================================================
-// CONFIG MESSAGE
-// ==================================================
-
-function decodeConfigMessageValue(
-  ciphertextStr
-) {
+function decodeConfigMessage(value) {
   if (
-    !ciphertextStr ||
-    !String(ciphertextStr).trim()
+    !value ||
+    !String(value).trim()
   ) {
-    return ciphertextStr;
+    return value;
   }
 
   try {
-    let padded =
-      String(ciphertextStr);
+    let padded = String(value);
 
-    while (
-      padded.length % 4 !== 0
-    ) {
+    while (padded.length % 4 !== 0) {
       padded += "=";
     }
-
-    /*
-     * Reference EHI:
-     *
-     * Base64 decode
-     * -> UTF-8
-     * -> Java UTF-16 code units
-     * -> XOR "EHIMSG"
-     */
 
     const raw =
       Buffer.from(
@@ -607,52 +431,50 @@ function decodeConfigMessageValue(
         "base64"
       );
 
-    const utf8Text =
+    /*
+     * Referensi HTTP Injector:
+     *
+     * base64
+     *   ↓
+     * UTF-8 string
+     *   ↓
+     * Java UTF-16 code units
+     *   ↓
+     * XOR EHIMSG
+     */
+
+    const text =
       raw.toString("utf8");
 
-    const key =
-      "EHIMSG";
+    const key = "EHIMSG";
 
-    const chars = [];
+    let result = "";
 
-    /*
-     * charCodeAt() di JavaScript
-     * bekerja menggunakan UTF-16 code unit,
-     * sama dengan Java char.
-     */
     for (
       let i = 0;
-      i < utf8Text.length;
+      i < text.length;
       i++
     ) {
-      const javaChar =
-        utf8Text.charCodeAt(i);
-
-      const keyChar =
+      const decoded =
+        text.charCodeAt(i) ^
         key.charCodeAt(
           i % key.length
         );
 
-      const decoded =
-        javaChar ^ keyChar;
-
-      chars.push(
-        String.fromCharCode(
-          decoded & 0xffff
-        )
+      result += String.fromCharCode(
+        decoded & 0xffff
       );
     }
 
-    return chars.join("");
-
+    return result;
   } catch {
-    return ciphertextStr;
+    return value;
   }
 }
 
-// ==================================================
-// READABLE CHECK
-// ==================================================
+// ============================================================
+// READABILITY
+// ============================================================
 
 function looksReadable(value) {
   if (
@@ -664,9 +486,7 @@ function looksReadable(value) {
 
   let bad = 0;
 
-  for (
-    const ch of value
-  ) {
+  for (const ch of value) {
     const code =
       ch.charCodeAt(0);
 
@@ -678,149 +498,94 @@ function looksReadable(value) {
     ) {
       bad++;
     }
+
+    if (code === 0xfffd) {
+      bad++;
+    }
   }
 
   return (
-    bad / value.length <
-    0.25
+    bad / value.length <= 0.15
   );
 }
 
-// ==================================================
+// ============================================================
 // POSSIBLE NOTE
-// ==================================================
+// ============================================================
 
 function decodePossibleNote(
-  value
+  value,
+  saltKey
 ) {
+  // Pertama coba EHIMSG
+  const javaDecoded =
+    decodeConfigMessage(value);
+
   if (
-    typeof value !== "string" ||
-    !value.trim()
+    javaDecoded !== value &&
+    looksReadable(javaDecoded)
   ) {
-    return value;
+    return javaDecoded;
   }
 
-  try {
-    const decoded =
-      decodeConfigMessageValue(
-        value
-      );
+  // Kemudian coba XOR layer normal
+  const xorDecoded =
+    decryptXorLayer(
+      value,
+      saltKey
+    );
 
-    if (
-      decoded &&
-      decoded !== value &&
-      looksReadable(decoded)
-    ) {
-      return decoded;
-    }
-  } catch {}
+  if (
+    xorDecoded !== null &&
+    looksReadable(xorDecoded)
+  ) {
+    return xorDecoded;
+  }
 
+  // Kalau gagal, jangan rusak data asli
   return value;
 }
 
-// ==================================================
-// INNER FIELDS
-// ==================================================
+// ============================================================
+// DECODE INNER FIELDS
+// ============================================================
 
 function decodeInnerFields(
-  obj,
+  parsedJson,
   saltKey
 ) {
-  if (
-    !obj ||
-    typeof obj !== "object"
-  ) {
-    return obj;
+  if (Array.isArray(parsedJson)) {
+    return parsedJson.map(
+      v =>
+        decodeInnerFields(
+          v,
+          saltKey
+        )
+    );
   }
 
-  const result =
-    Array.isArray(obj)
-      ? []
-      : {};
+  if (
+    !parsedJson ||
+    typeof parsedJson !== "object"
+  ) {
+    return parsedJson;
+  }
+
+  const cleaned = {};
 
   for (
     const [key, value]
-    of Object.entries(obj)
+    of Object.entries(parsedJson)
   ) {
+    const lower =
+      key.toLowerCase();
 
-    // ================================================
-    // STRING
-    // ================================================
-
-    if (
-      typeof value === "string" &&
-      value.trim()
-    ) {
-
-      // --------------------------------------------
-      // configMessage
-      // --------------------------------------------
-
-      if (
-        key === "configMessage"
-      ) {
-        result[key] =
-          decodeConfigMessageValue(
-            value
-          );
-
-        continue;
-      }
-
-      // --------------------------------------------
-      // note / message / remark / description
-      // --------------------------------------------
-
-      if (
-        [
-          "note",
-          "message",
-          "remark",
-          "description"
-        ].includes(
-          key.toLowerCase()
-        )
-      ) {
-        result[key] =
-          decodePossibleNote(
-            value
-          );
-
-        continue;
-      }
-
-      // --------------------------------------------
-      // Field normal
-      // --------------------------------------------
-
-      try {
-        const decoded =
-          decryptConfigData(
-            value,
-            saltKey
-          );
-
-        result[key] =
-          decoded == null
-            ? value
-            : decoded;
-
-      } catch {
-        result[key] = value;
-      }
-
-      continue;
-    }
-
-    // ================================================
-    // OBJECT / ARRAY
-    // ================================================
-
+    // Object / array
     if (
       value &&
       typeof value === "object"
     ) {
-      result[key] =
+      cleaned[key] =
         decodeInnerFields(
           value,
           saltKey
@@ -829,39 +594,86 @@ function decodeInnerFields(
       continue;
     }
 
-    // ================================================
-    // OTHER
-    // ================================================
+    // String
+    if (
+      typeof value === "string" &&
+      value.trim()
+    ) {
+      // configMessage
+      if (
+        lower ===
+        "configmessage"
+      ) {
+        cleaned[key] =
+          decodeConfigMessage(
+            value
+          );
 
-    result[key] = value;
+        continue;
+      }
+
+      // Note aliases
+      if (
+        [
+          "note",
+          "message",
+          "remark",
+          "description"
+        ].includes(lower)
+      ) {
+        cleaned[key] =
+          decodePossibleNote(
+            value,
+            saltKey
+          );
+
+        continue;
+      }
+
+      // Field normal
+      const decrypted =
+        decryptXorLayer(
+          value,
+          saltKey
+        );
+
+      cleaned[key] =
+        decrypted !== null
+          ? decrypted
+          : value;
+
+      continue;
+    }
+
+    cleaned[key] = value;
   }
 
-  /*
-   * Kalau EHI hanya memiliki configMessage,
-   * buat alias note supaya frontend
-   * tetap bisa menampilkan bagian Note.
-   */
+  // Kalau EHI menyimpan configMessage,
+  // frontend bisa langsung menampilkan sebagai Note.
   if (
-    typeof result.configMessage === "string" &&
-    !Object.prototype.hasOwnProperty.call(
-      result,
-      "note"
-    )
+    typeof cleaned.configMessage ===
+      "string" &&
+    !cleaned.note
   ) {
-    result.note =
-      result.configMessage;
+    cleaned.note =
+      cleaned.configMessage;
   }
 
-  return result;
+  return cleaned;
 }
 
-// ==================================================
+// ============================================================
 // NESTED JSON
-// ==================================================
+// ============================================================
 
-function parseNestedJSON(
-  config
-) {
+function parseNestedJsonFields(obj) {
+  if (
+    !obj ||
+    typeof obj !== "object"
+  ) {
+    return obj;
+  }
+
   for (
     const key of [
       "v2rRawJson",
@@ -869,26 +681,54 @@ function parseNestedJSON(
     ]
   ) {
     if (
-      typeof config[key] === "string"
+      typeof obj[key] !== "string"
     ) {
-      try {
-        config[key] =
-          JSON.parse(
-            config[key]
-          );
-      } catch {
-        // Bukan JSON valid,
-        // biarkan sebagai string.
+      continue;
+    }
+
+    try {
+      const raw = obj[key];
+
+      const start =
+        raw.indexOf("{");
+
+      const end =
+        raw.lastIndexOf("}");
+
+      if (
+        start < 0 ||
+        end < start
+      ) {
+        continue;
       }
+
+      const parsed =
+        JSON.parse(
+          raw.slice(
+            start,
+            end + 1
+          )
+        );
+
+      obj[key] =
+        typeof parsed === "string"
+          ? JSON.parse(parsed)
+          : parsed;
+    } catch (err) {
+      obj[
+        `${key}_PARSING_ERROR`
+      ] =
+        err?.message ||
+        String(err);
     }
   }
 
-  return config;
+  return obj;
 }
 
-// ==================================================
+// ============================================================
 // XCHACHA20-POLY1305
-// ==================================================
+// ============================================================
 
 async function decryptXChaCha(
   key,
@@ -897,18 +737,6 @@ async function decryptXChaCha(
   tag,
   aad
 ) {
-  if (key.length !== 32) {
-    throw new Error(
-      `XChaCha key harus 32 byte, dapat ${key.length}`
-    );
-  }
-
-  if (nonce.length !== 24) {
-    throw new Error(
-      `XChaCha nonce harus 24 byte, dapat ${nonce.length}`
-    );
-  }
-
   const {
     xchacha20poly1305
   } = await import(
@@ -919,31 +747,26 @@ async function decryptXChaCha(
     xchacha20poly1305(
       new Uint8Array(key),
       new Uint8Array(nonce),
-      aad
-        ? new Uint8Array(aad)
-        : undefined
+      new Uint8Array(aad)
     );
-
-  const combined =
-    Buffer.concat([
-      ciphertext,
-      tag
-    ]);
 
   return Buffer.from(
     cipher.decrypt(
-      new Uint8Array(combined)
+      new Uint8Array(
+        Buffer.concat([
+          ciphertext,
+          tag
+        ])
+      )
     )
   );
 }
 
-// ==================================================
-// MAIN EHI DECRYPTOR
-// ==================================================
+// ============================================================
+// MAIN EHI DECRYPT
+// ============================================================
 
-async function ehiDecrypt(
-  buffer
-) {
+async function ehiDecrypt(buffer) {
   if (
     !Buffer.isBuffer(buffer) ||
     !buffer.length
@@ -953,367 +776,310 @@ async function ehiDecrypt(
     );
   }
 
-  // ==================================================
-  // PARSE CONTAINER
-  // ==================================================
+  // ==========================================================
+  // 1. CONTAINER
+  // ==========================================================
 
   const payload =
-    extractEhiPayload(buffer);
+    parseEhiBytes(buffer);
 
-  if (
-    !payload ||
-    payload.length < 16
-  ) {
+  if (!payload.length) {
     throw new Error(
-      "Payload EHI tidak valid"
+      "Payload EHI kosong"
     );
   }
 
-  // ==================================================
-  // LAYER 1
-  // ==================================================
+  // ==========================================================
+  // 2. LAYER 1 + LAYER 2 + XXTEA
+  // ==========================================================
 
-  const allIVs = [
-    ...EHI.BYPASS_IVS.map(
-      iv => ({
-        iv,
-        bypass: true
-      })
-    ),
+  let config = null;
+  let matchedIv = null;
 
-    ...EHI.STANDARD_IVS.map(
-      iv => ({
-        iv,
-        bypass: false
-      })
-    )
+  const allIvs = [
+    ...EHI.BYPASS_IVS,
+    ...EHI.STANDARD_IVS
   ];
 
-  let parsedConfig = null;
-  let matchedBypass = false;
-
-  for (
-    const item of allIVs
-  ) {
+  for (const iv of allIvs) {
     try {
-
-      // ==============================================
-      // AES LAYER 1
-      // ==============================================
-
       const layer1 =
         aesCbcDecrypt(
           EHI.L1_KEY,
-          item.iv,
+          iv,
           payload
         );
 
-      const message =
-        layer1.toString(
-          "utf8"
-        );
-
-      /*
-       * Format:
-       *
-       * IV : something : ciphertext
-       */
+      const layer1Text =
+        layer1.toString("utf8");
 
       const parts =
-        message.split(":");
+        layer1Text.split(":");
 
-      if (
-        parts.length < 3
-      ) {
+      if (parts.length < 3) {
         continue;
       }
 
-      // ==============================================
-      // IV LAYER 2
-      // ==============================================
-
       const iv2 =
         Buffer.from(
-          parts[0].trim(),
+          parts[0],
           "base64"
         );
 
-      const ciphertext2 =
+      const cipher2 =
         Buffer.from(
-          parts[2].trim(),
+          parts[2],
           "base64"
         );
 
       if (
         iv2.length !== 16 ||
-        ciphertext2.length === 0 ||
-        ciphertext2.length % 16 !== 0
+        !cipher2.length
       ) {
         continue;
       }
-
-      // ==============================================
-      // AES LAYER 2
-      // ==============================================
 
       const layer2 =
         aesCbcDecrypt(
           EHI.L2_KEY_STATIC,
           iv2,
-          ciphertext2
+          cipher2
         );
 
-      // ==============================================
-      // XXTEA
-      // ==============================================
-
-      const xxtea =
+      const raw =
         xxteaDecrypt(
           layer2,
           EHI.EOO_MASTER_KEY
         );
 
-      // ==============================================
-      // JSON
-      // ==============================================
+      const start =
+        raw.indexOf(0x7b);
 
-      const config =
-        decodeConfigMessage(
-          xxtea
+      if (start < 0) {
+        continue;
+      }
+
+      const candidate =
+        JSON.parse(
+          raw
+            .subarray(start)
+            .toString("utf8")
         );
 
       if (
-        config &&
-        typeof config === "object"
+        candidate &&
+        typeof candidate ===
+          "object" &&
+        !Array.isArray(candidate)
       ) {
-        parsedConfig =
-          config;
-
-        matchedBypass =
-          item.bypass;
-
+        config = candidate;
+        matchedIv = iv;
         break;
       }
-
     } catch {
-      // Coba IV berikutnya.
+      continue;
     }
   }
 
-  // ==================================================
-  // CONFIG GAGAL
-  // ==================================================
-
-  if (!parsedConfig) {
+  if (!config) {
     throw new Error(
       "Tidak dapat membuka layer EHI. IV/key tidak cocok."
     );
   }
 
-  // ==================================================
-  // BYPASS CONFIG
-  // ==================================================
+  // ==========================================================
+  // 3. BYPASS / STANDARD
+  // ==========================================================
 
-  let finalConfig =
-    parsedConfig;
+  const targetSalt =
+    config.configSalt ||
+    "EVZJNI";
 
-  // ==================================================
-  // STANDARD CONFIG
-  // ==================================================
+  let parsedFinal;
 
-  if (!matchedBypass) {
+  const isBypass =
+    EHI.BYPASS_IVS.some(
+      iv =>
+        iv.equals(matchedIv)
+    );
 
-    if (
-      !parsedConfig.configData
-    ) {
+  // ==========================================================
+  // BYPASS
+  // ==========================================================
+
+  if (isBypass) {
+    parsedFinal = config;
+  }
+
+  // ==========================================================
+  // STANDARD
+  // ==========================================================
+
+  else {
+    const targetData =
+      config.configData;
+
+    if (!targetData) {
       throw new Error(
-        "configData tidak ditemukan"
+        "configData EHI tidak ditemukan"
       );
     }
 
-    // ==============================================
-    // XOR CONFIG DATA
-    // ==============================================
-
-    const encoded =
-      decryptConfigData(
-        parsedConfig.configData,
-        parsedConfig.configSalt ||
-          "EVZJNI"
+    const decodedLayer =
+      decryptXorLayer(
+        targetData,
+        targetSalt
       );
 
-    const cleanEncoded =
-      String(encoded)
-        .replace(/\s+/g, "");
+    if (!decodedLayer) {
+      throw new Error(
+        "configData EHI gagal didekripsi"
+      );
+    }
 
-    let raw;
+    let rawPayload;
 
     try {
-      raw =
+      rawPayload =
         Buffer.from(
-          cleanEncoded,
+          decodedLayer,
           "base64"
         );
     } catch {
       throw new Error(
-        "configData EHI bukan Base64 yang valid"
+        "configData EHI bukan base64 yang valid"
       );
     }
 
-    // ==============================================
-    // RAW PAYLOAD
-    // ==============================================
-
-    if (
-      raw.length <
-      0x32 + 16
-    ) {
+    if (rawPayload.length <= 50) {
       throw new Error(
         "Payload EHI terlalu pendek"
       );
     }
 
-    /*
-     * Struktur:
-     *
-     * 00          version/header
-     * 01..04      time cost
-     * 05..08      memory cost
-     * 09          parallelism
-     * 0A..19      salt
-     * 1A..31      nonce
-     * 00..19      AAD
-     * 32..end-16  ciphertext
-     * end-16..end tag
-     */
+    // ========================================================
+    // RAW PAYLOAD HEADER
+    // ========================================================
+
+    const timeCost =
+      rawPayload.readUInt32LE(1);
+
+    const memoryCost =
+      rawPayload.readUInt32LE(5);
+
+    const parallelism =
+      rawPayload[9];
 
     const salt =
-      raw.subarray(
+      rawPayload.subarray(
         0x0a,
         0x1a
       );
 
-    const timeCost =
-      raw.readUInt32LE(1);
-
-    const memoryCost =
-      raw.readUInt32LE(5);
-
-    const parallelism =
-      raw[9];
-
     const nonce =
-      raw.subarray(
+      rawPayload.subarray(
         0x1a,
         0x32
       );
 
     const aad =
-      raw.subarray(
+      rawPayload.subarray(
         0,
         0x1a
       );
 
     const ciphertext =
-      raw.subarray(
+      rawPayload.subarray(
         0x32,
-        raw.length - 16
+        rawPayload.length - 16
       );
 
     const tag =
-      raw.subarray(
-        raw.length - 16
+      rawPayload.subarray(
+        rawPayload.length - 16
       );
 
-    // ==============================================
-    // MASTER KEY
-    // ==============================================
-
-    const password =
-      generateMasterKey(
-        parsedConfig
+    if (
+      !timeCost ||
+      !memoryCost ||
+      !parallelism
+    ) {
+      throw new Error(
+        "Parameter Argon2 EHI tidak valid"
       );
+    }
 
-    // ==============================================
+    // ========================================================
     // ARGON2ID
-    // ==============================================
+    // ========================================================
 
-    const key =
+    const masterKey =
+      generateMasterKey(
+        config
+      );
+
+    const argonKey =
       await argon2.hash(
-        password,
+        masterKey,
         {
-          type:
-            argon2.argon2id,
-
+          type: argon2.argon2id,
           timeCost,
-
           memoryCost,
-
           parallelism,
-
           hashLength: 32,
-
           salt,
-
           raw: true
         }
       );
 
-    // ==============================================
-    // XCHACHA20
-    // ==============================================
+    // ========================================================
+    // XCHACHA20 POLY1305
+    // ========================================================
 
     const decrypted =
       await decryptXChaCha(
-        key,
+        argonKey,
         nonce,
         ciphertext,
         tag,
         aad
       );
 
-    // ==============================================
-    // FINAL JSON
-    // ==============================================
+    // ========================================================
+    // JSON
+    // ========================================================
 
-    try {
-      finalConfig =
-        JSON.parse(
-          decrypted.toString(
-            "utf8"
-          )
-        );
-
-    } catch {
-      throw new Error(
-        "Isi EHI berhasil didekripsi tetapi JSON final tidak valid"
+    parsedFinal =
+      JSON.parse(
+        decrypted.toString("utf8")
       );
-    }
   }
 
-  // ==================================================
-  // DECODE INNER FIELDS
-  // ==================================================
+  // ==========================================================
+  // 4. DECODE INNER FIELDS
+  //
+  // NOTE TIDAK DIPROSES SEBELUM XCHACHA.
+  // Jadi tidak mengganggu proses authentication tag.
+  // ==========================================================
 
-  finalConfig =
+  const cleaned =
     decodeInnerFields(
-      finalConfig,
-      parsedConfig.configSalt ||
-        "EVZJNI"
+      parsedFinal,
+      targetSalt
     );
 
-  // ==================================================
-  // NESTED JSON
-  // ==================================================
+  // ==========================================================
+  // 5. NESTED JSON
+  // ==========================================================
 
-  finalConfig =
-    parseNestedJSON(
-      finalConfig
+  const finalConfig =
+    parseNestedJsonFields(
+      cleaned
     );
 
-  // ==================================================
-  // RESULT
-  // ==================================================
+  // ==========================================================
+  // 6. RESULT
+  // ==========================================================
 
   return {
     success: true,
@@ -1327,13 +1093,8 @@ async function ehiDecrypt(
         4
       ),
 
-    data:
-      finalConfig
+    data: finalConfig
   };
 }
-
-// ==================================================
-// EXPORT
-// ==================================================
 
 module.exports = ehiDecrypt;
